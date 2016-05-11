@@ -3,10 +3,12 @@
 __version__ = "1.0.6"
 
 import asyncio
+import functools
 import socket
 import errno
 import msgpack
 import base64
+import signal
 
 import tarantool
 from tarantool.response import Response
@@ -161,6 +163,7 @@ class Connection(tarantool.Connection):
 
         self.error = False  # important not raise exception in response reader
         self.schema = Schema(self)  # need schema with lock
+        self._legacy_signal_handlers = None  # previous signal handlers
 
     @asyncio.coroutine
     def connect(self):
@@ -181,6 +184,14 @@ class Connection(tarantool.Connection):
             self._write_buf = b""
 
             self._auth_event = asyncio.Event(loop=self.loop)
+            handlers = getattr(self.loop, "_signal_handlers", None)
+            if handlers is not None:
+                self._legacy_signal_handlers = dict(handlers)
+                for signum in (signal.SIGINT, signal.SIGTERM):
+                    self.loop.add_signal_handler(
+                        signum,
+                        functools.partial(self._handle_bad_signal, signum)
+                    )
 
         if self.user and self.password:
             yield from self._auth_event.wait()
@@ -292,33 +303,65 @@ class Connection(tarantool.Connection):
     def close(self):
         yield from self._do_close(None)
 
+    @asyncio.coroutine
     def _do_close(self, exc):
         if not self.connected:
             return
 
         with (yield from self.lock):
-            self.connected = False
-            self._writer.transport.close()
-            self._reader_task.cancel()
-            self._reader_task = None
+            self.__do_close_unlocked(exc)
 
-            self._writer_task.cancel()
-            self._writer_task = None
-            self._write_event = None
-            self._write_buf = None
+    def _do_close_unlocked(self, exc):
+        assert self.connected
+        self.connected = False
+        self._writer.transport.close()
+        self._reader_task.cancel()
+        self._reader_task = None
 
-            self._writer = None
-            self._reader = None
+        self._writer_task.cancel()
+        self._writer_task = None
+        self._write_event = None
+        self._write_buf = None
 
-            self._auth_event = None
+        self._writer = None
+        self._reader = None
 
-            for waiter in self._waiters.values():
-                if exc is None:
-                    waiter.cancel()
-                else:
-                    waiter.set_exception(exc)
+        self._auth_event = None
 
-            self._waiters = dict()
+        for waiter in self._waiters.values():
+            if exc is None:
+                waiter.cancel()
+            else:
+                waiter.set_exception(exc)
+
+        self._waiters = dict()
+        handlers = getattr(self.loop, "_signal_handlers", None)
+        if handlers is not None:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    handlers[signum] = self._legacy_signal_handlers[signum]
+                except KeyError:
+                    self.loop.remove_signal_handler(signum)
+        self._legacy_signal_handlers = None
+
+    def _handle_bad_signal(self, signum):
+        if signum == signal.SIGINT:
+            exc = KeyboardInterrupt
+        elif signum == signal.SIGTERM:
+            exc = SystemExit
+        else:
+            exc = None
+        handlers = self._legacy_signal_handlers
+        self._do_close_unlocked(exc)
+        try:
+            handler = handlers[signum]
+        except KeyError:
+            return
+        try:
+            func = handler._callback
+        except AttributeError:
+            return
+        func()
 
     def __repr__(self):
         return "aiotarantool.Connection(host=%r, port=%r)" % (self.host, self.port)
@@ -470,4 +513,3 @@ class Connection(tarantool.Connection):
             return "Success"
 
         return t1 - t0
-
