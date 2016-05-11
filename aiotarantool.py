@@ -471,3 +471,4 @@ class Connection(tarantool.Connection):
 
         return t1 - t0
 
+
